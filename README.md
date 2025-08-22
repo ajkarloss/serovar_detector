@@ -58,3 +58,7 @@ An overview of the available options:
                      in R. (Default False)
 ```
 
+# Citation
+If you are using our tool in your analysis, please consider to cite us.
+
+> Angen Ø, Karstensen KT, Vilaró A, et al. Serotyping of *Actinobacillus pleuropneumoniae* based on whole genome sequencing: validation of a bioinformatic tool. *Microb Genom.* 2025;11(7):001434. doi:10.1099/mgen.0.001434
