@@ -5,8 +5,10 @@ This repository provides a pipeline for detecting capsule genes and dessiminate 
 
 # Setup
 ## Requirements
-* snakemake
-* conda >= 24.7.1 
+* snakemake >= 8.+
+* conda >= 24.7.1
+
+I recommend creating a single Conda environment containing the **latest** versions of the required software
 
 ## Installation
 1. (Recommendation) Use Micromamba or the like to set up an environment with the above requirement.
