@@ -1,7 +1,7 @@
 # Serovar detector
 Actinobacillus pleuropneumoniae causes severe respiratory illness in production pigs and piglets. One major task in the prohobition of spread as well as treatment, is to identify the composition of capsule genes. These capsule genes can in combination be used too provide servariant typing of A. pleuropneumoniae.
 
-This repository provides a pipeline for detecting capsule genes and dessiminate serovar from combination of present genes.
+This repository provides a pipeline for detecting capsule genes and dessiminate serovar from combination of present genes. 
 
 # Setup
 ## Requirements
@@ -23,6 +23,14 @@ Assuming that you have navigated into the repository folder (e.g. ~/repos/serova
 ```
 python serovar_detector.py -r /path/to/input/reads -a /path/to/input/assemblies -D db/Actinobacillus_pleuropneumoniae -o /path/to/output/serovar_detector/ -t [nr. of threads]
 ```
+
+## Input
+Serovar detector supports multiple input types in a single run, but for any given sample only expects one of the following;
+* Illumina Paired end sequencing reads
+* Genome assemblies
+
+## Output
+A single tab-separated file `serovars.tsv`.
 
 ## Options
 ```
