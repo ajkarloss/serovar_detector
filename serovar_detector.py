@@ -1,384 +1,636 @@
-#!/bin/python
+#!/usr/bin/env python3
 
 import argparse
-import os
-import sys
-import yaml
 import glob
-import subprocess
+import os
 import re
-import pandas
 import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import pandas as pd
+import yaml
 
 
-def validate_snakemake(debug):
-  here = os.listdir('.')
-  workflow_here = 'workflow' in os.listdir('.')
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
 
-  if (workflow_here):
-    snakefile_here = "Snakefile" in os.listdir('workflow')
 
-    if snakefile_here and debug:
-      print("Snakefile detected")
-    elif not snakefile_here:
-      print('Error no Snakefile detected in workflow directory. Software is properbly corrupt, consider redownloading.')
-      sys.exit(1)
-  else:
-    print('No workflow directory detected, are you sure you are running the script from the software folder?')
+def validate_snakemake(tool_dir, debug=False):
+    """
+    Validate that workflow/Snakefile exists relative to this script.
+    This makes the script work from any current working directory.
+    """
+    workflow_dir = tool_dir / "workflow"
+    snakefile = workflow_dir / "Snakefile"
+
+    if not workflow_dir.is_dir():
+        eprint(f"ERROR: No workflow directory detected at: {workflow_dir}")
+        eprint("Software is probably corrupt. Consider redownloading.")
+        sys.exit(1)
+
+    if not snakefile.is_file():
+        eprint(f"ERROR: No Snakefile detected at: {snakefile}")
+        eprint("Software is probably corrupt. Consider redownloading.")
+        sys.exit(1)
+
+    if debug:
+        print(f"Snakefile detected: {snakefile}")
+
+    return snakefile
+
+
+def ensure_writable_dir(path):
+    """
+    Create a directory if needed and verify it is writable.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    test_file = path / ".write_test"
+    try:
+        with open(test_file, "w") as handle:
+            handle.write("ok\n")
+        test_file.unlink()
+    except OSError as exc:
+        raise OSError(f"Directory is not writable: {path}") from exc
+
+
+def resolve_conda_prefix(args_conda_prefix, tool_dir, outdir, debug=False):
+    """
+    Resolve conda cache location in a portable way.
+
+    Priority:
+      1. --conda-prefix
+      2. SEROVAR_DETECTOR_CONDA_PREFIX environment variable
+      3. <tool_dir>/.snakemake/conda   (if writable)
+      4. ~/.cache/serovar_detector/snakemake/conda   (if writable)
+      5. <outdir>/.snakemake/conda
+
+    This gives a reusable cache where possible, while still working in
+    read-only installations and shared environments.
+    """
+    env_conda_prefix = os.environ.get("SEROVAR_DETECTOR_CONDA_PREFIX")
+
+    candidates = []
+
+    if args_conda_prefix:
+        candidates.append(Path(args_conda_prefix).expanduser().resolve())
+    elif env_conda_prefix:
+        candidates.append(Path(env_conda_prefix).expanduser().resolve())
+    else:
+        candidates.append((tool_dir / ".snakemake" / "conda").resolve())
+
+        home_dir = Path.home()
+        if str(home_dir) not in ("", "."):
+            candidates.append((home_dir / ".cache" / "serovar_detector" / "snakemake" / "conda").resolve())
+
+        candidates.append((Path(outdir).resolve() / ".snakemake" / "conda").resolve())
+
+    last_error = None
+    for candidate in candidates:
+        try:
+            ensure_writable_dir(candidate)
+            if debug:
+                print(f"Using conda prefix: {candidate}")
+            return str(candidate)
+        except OSError as exc:
+            last_error = exc
+            if debug:
+                print(f"Conda prefix not usable: {candidate} ({exc})")
+
+    eprint("ERROR: Could not create a usable conda prefix directory.")
+    if last_error:
+        eprint(str(last_error))
     sys.exit(1)
 
 
 def generate_configfile(database, outdir, threshold, append_results, threads, debug, tmpdir):
-  # Define config file
-  config_file = "config/config.yaml"
-  
-  # Check for existing config file
-  if not os.path.isfile(config_file):
-    config_dir = os.path.dirname(config_file)
-    
-    # Check for existing config dir
-    if not os.path.isdir(config_dir):
-      print("No config dir detected, creating directory.")
-      os.makedirs(config_dir)
+    """
+    Write config into the job outdir so Snakemake (running with --directory outdir)
+    reads config/config.yaml from that job-specific working directory.
+    """
+    outdir_path = Path(outdir).resolve()
+    config_file = outdir_path / "config" / "config.yaml"
+    config_file.parent.mkdir(parents=True, exist_ok=True)
 
-  out_path = os.path.abspath(outdir).rstrip("/")
-  
-  config = {
-    "database": database, "outdir": out_path, "threshold": threshold,
-    "append_results": append_results, "threads": threads, "debug": debug,
-    "tmpdir": tmpdir
-  }
+    config = {
+        "database": str(Path(database).resolve()),
+        "outdir": str(outdir_path).rstrip("/"),
+        "threshold": threshold,
+        "append_results": append_results,
+        "threads": threads,
+        "debug": debug,
+        "tmpdir": str(Path(tmpdir).resolve()),
+    }
 
-  with open(config_file, "w") as config_yaml:
-    yaml.dump(config, config_yaml)
+    with open(config_file, "w") as config_yaml:
+        yaml.safe_dump(config, config_yaml)
+
+    return str(config_file)
 
 
-def screen_files(directory, type):
-  if type == "Reads":
-    # Screen for files
-    fastqs = [sample_read for sample_read in glob.glob("%s/*.fastq*" %directory)]
-    fqs = [sample_read for sample_read in glob.glob("%s/*.fq*" %directory)]
+def screen_files(directory, file_type):
+    """
+    Scan input directories for reads or assemblies and return a metadata dataframe.
+    """
+    if not directory:
+        if file_type == "Reads":
+            return pd.DataFrame(columns=["sample_name", "mate", "file", "type"])
+        if file_type == "Assembly":
+            return pd.DataFrame(columns=["sample_name", "file", "type"])
+        return pd.DataFrame(columns=["sample_name", "mate", "file", "type"])
 
-    # Combine file lists
-    read_files = fastqs + fqs
+    directory = str(Path(directory).resolve())
 
-    # Search file names for metadata
-    pattern = "^(?P<file>\S+\/(?P<sample_name>\S+?)((_S\d+)(_L\d+))?_(?P<mate>[Rr]?[12])(_\d{3})?\.(?P<ext>((fastq)?(fq)?)?(\.gz)?))"
-    search = [re.search(pattern, read_file) for read_file in read_files]
+    if file_type == "Reads":
+        fastqs = glob.glob(f"{directory}/*.fastq*")
+        fqs = glob.glob(f"{directory}/*.fq*")
+        read_files = sorted(set(fastqs + fqs))
 
-    # Generate DataFrame from search object groups
-    metadata_raw = pandas.DataFrame({
-      "sample_name": [search.group("sample_name") for search in search],
-      "mate": [search.group("mate") for search in search],
-      "file": [search.group("file") for search in search],
-      "type": type
-    })
-    
-    # Sort table
-    metadata = metadata_raw.sort_values(by = ["sample_name", "mate"])
- 
-  elif type == "Assembly":
-    # Screen for files
-    fastas = [sample_assembly for sample_assembly in glob.glob("%s/*.fasta" %directory)]
-    fas = [sample_assembly for sample_assembly in glob.glob("%s/*.fa" %directory)]
+        if len(read_files) == 0:
+            return pd.DataFrame(columns=["sample_name", "mate", "file", "type"])
 
-    # Combine file lists
-    assembly_files = fastas + fas
+        pattern = (
+            r"^(?P<file>\S+\/(?P<sample_name>\S+?)"
+            r"((_S\d+)(_L\d+))?_(?P<mate>[Rr]?[12])(_\d{3})?"
+            r"\.(?P<ext>((fastq)?(fq)?)?(\.gz)?))$"
+        )
+        search = [re.search(pattern, read_file) for read_file in read_files]
+        search = [s for s in search if s is not None]
 
-    # Search file names for metadata
-    pattern = "^(?P<file>\S+\/(?P<sample_name>\S+)\.(?P<ext>[fast]+))"
-    search = [re.search(pattern, assembly_file) for assembly_file in assembly_files]
+        if len(search) == 0:
+            return pd.DataFrame(columns=["sample_name", "mate", "file", "type"])
 
-    # Generate DataFrame from search object groups
-    metadata_raw = pandas.DataFrame({
-      "sample_name": [search.group("sample_name") for search in search],
-      "file": [search.group("file") for search in search],
-      "type": type
-    })
+        metadata_raw = pd.DataFrame(
+            {
+                "sample_name": [s.group("sample_name") for s in search],
+                "mate": [s.group("mate") for s in search],
+                "file": [s.group("file") for s in search],
+                "type": file_type,
+            }
+        )
 
-    # Sort table
-    metadata = metadata_raw.sort_values(by = "sample_name")
+        metadata = metadata_raw.sort_values(by=["sample_name", "mate"]).reset_index(drop=True)
 
-  else:
-    return(pandas.DataFrame({"sample_name", "mate", "file", "type"}))
-  
-  return(metadata) #file_metadata
+    elif file_type == "Assembly":
+        fastas = glob.glob(f"{directory}/*.fasta")
+        fas = glob.glob(f"{directory}/*.fa")
+        assembly_files = sorted(set(fastas + fas))
+
+        if len(assembly_files) == 0:
+            return pd.DataFrame(columns=["sample_name", "file", "type"])
+
+        pattern = r"^(?P<file>\S+\/(?P<sample_name>\S+)\.(fasta|fa))$"
+        search = [re.search(pattern, assembly_file) for assembly_file in assembly_files]
+        search = [s for s in search if s is not None]
+
+        if len(search) == 0:
+            return pd.DataFrame(columns=["sample_name", "file", "type"])
+
+        metadata_raw = pd.DataFrame(
+            {
+                "sample_name": [s.group("sample_name") for s in search],
+                "file": [s.group("file") for s in search],
+                "type": file_type,
+            }
+        )
+
+        metadata = metadata_raw.sort_values(by="sample_name").reset_index(drop=True)
+
+    else:
+        return pd.DataFrame(columns=["sample_name", "mate", "file", "type"])
+
+    return metadata
 
 
 def create_symlinks(metadata, outdir):
-  # Iterating voer each row
-  for row in range(len(metadata.index)):
-    # Extracting sample information
-    sample_metadata = metadata.loc[row]
-    sample_name = sample_metadata["sample_name"]
+    """
+    Create normalized symlinks into the temporary working directory.
+    """
+    outdir_path = Path(outdir).resolve()
 
-    # Generate link filenames
-    if sample_metadata["type"] == "Reads":
-      # Ensuring outdir exists
-      os.makedirs(name = f"{outdir}/reads", exist_ok = True)
+    for _, sample_metadata in metadata.iterrows():
+        sample_name = sample_metadata["sample_name"]
 
-      # Defining input and output
-      mate = sample_metadata["mate"]
-      sample_file = os.path.realpath(sample_metadata["file"])
-      sample_link = f"{outdir}/reads/{sample_name}_{mate}.fastq.gz"
+        if sample_metadata["type"] == "Reads":
+            reads_dir = outdir_path / "reads"
+            reads_dir.mkdir(parents=True, exist_ok=True)
 
-    else:
-      # Ensuring outdir exists
-      os.makedirs(name = f"{outdir}/assemblies", exist_ok = True)
+            mate = sample_metadata["mate"]
+            sample_file = Path(sample_metadata["file"]).resolve()
+            sample_link = reads_dir / f"{sample_name}_{mate}.fastq.gz"
+        else:
+            assemblies_dir = outdir_path / "assemblies"
+            assemblies_dir.mkdir(parents=True, exist_ok=True)
 
-      # Defining input and output  
-      sample_file = os.path.realpath(sample_metadata["file"])
-      sample_link = f"{outdir}/assemblies/{sample_name}.fasta"
+            sample_file = Path(sample_metadata["file"]).resolve()
+            sample_link = assemblies_dir / f"{sample_name}.fasta"
 
-    # Symlinking file
-    if not os.path.exists(sample_link):
-      try:
-        os.symlink(src = sample_file, dst = sample_link)
-      except FileExistsError:
-        os.unlink(sample_link)
-        os.symlink(src = sample_file, dst = sample_link)
+        if sample_link.exists() or sample_link.is_symlink():
+            sample_link.unlink()
 
-  print("Files successfully linked!")
-  return True
+        os.symlink(str(sample_file), str(sample_link))
+
+    print("Files successfully linked!")
+    return True
 
 
 def make_sample_sheet(table):
-  print("Generating sample sheet", end = "... ")
+    print("Generating sample sheet", end="... ")
 
-  file_count = len(table.index)
-  
-  if file_count > 0:
-    sample_subset = table[["sample_name", "type"]]
-    sample_sheet = sample_subset.drop_duplicates()
-  else:
-    print("Failed: Subsample sheet has no rows")
-    sample_sheet = False
+    if len(table.index) > 0:
+        sample_subset = table[["sample_name", "type"]]
+        sample_sheet = sample_subset.drop_duplicates().reset_index(drop=True)
+    else:
+        eprint("ERROR: Sample sheet has no rows.")
+        sys.exit(1)
 
-  print("Success: A total of %s samples have been annotated!" %len(sample_sheet.index))
-  return(sample_sheet)
+    print(f"Success: A total of {len(sample_sheet.index)} samples have been annotated!")
+    return sample_sheet
 
 
 def write_sample_sheet(sample_sheet, pepdir):
-  sample_file = f"{pepdir}/sample_sheet.csv"
-  sample_exists = os.path.exists(sample_file)
+    sample_file = Path(pepdir) / "sample_sheet.csv"
+    sample_exists = sample_file.exists()
 
-  print("Writting sample sheet", end = "... ")
-  sample_sheet.to_csv(sample_file, index = False)
-  if sample_exists:
-    print("Success: Overwritting %s" %sample_file)
-  else:
-    print("Success: Written to %s" %sample_file)
-    
+    print("Writing sample sheet", end="... ")
+    sample_sheet.to_csv(sample_file, index=False)
+
+    if sample_exists:
+        print(f"Success: Overwriting {sample_file}")
+    else:
+        print(f"Success: Written to {sample_file}")
+
 
 def write_subsample_sheet(subsample_sheet, pepdir):
-  subsample_file = f"{pepdir}/subsample_sheet.csv"
-  subsample_exists = os.path.exists(subsample_file)
+    subsample_file = Path(pepdir) / "subsample_sheet.csv"
+    subsample_exists = subsample_file.exists()
 
-  print("Writting subsample sheet", end = "... ")
-  subsample_sheet.to_csv(subsample_file, index = False)
+    print("Writing subsample sheet", end="... ")
+    subsample_sheet.to_csv(subsample_file, index=False)
 
-  if subsample_exists:
-    print("Success: Overwritting %s" %subsample_file)
-  else:
-    print("Success: Written to %s" %subsample_file)
+    if subsample_exists:
+        print(f"Success: Overwriting {subsample_file}")
+    else:
+        print(f"Success: Written to {subsample_file}")
 
 
-def write_PEP(pepdir):
-  # Define pep files
-  pep_file = f"{pepdir}/project_config.yaml"
-  pep_exists = os.path.exists(pep_file)
-  
-  # Generate PEP configuration:
-  PEP_header = "pep_version: 2.1.0\n"
-  PEP_sample = "sample_table: 'sample_sheet.csv'\n"
-  PEP_subsample = "subsample_table: 'subsample_sheet.csv'"
- 
-  print("Writing project configuration file", end = "... ")
-  with open(pep_file, "w") as config_file:
-    config_file.write(PEP_header)
-    config_file.write(PEP_sample)
-    config_file.write(PEP_subsample)
-    
-  if not pep_exists:
-    print("Success: Written to %s" %pep_file)
-  elif pep_exists:
-    print("Success: Overwriting %s" %pep_file)
-  
+def write_pep(pepdir):
+    pep_file = Path(pepdir) / "project_config.yaml"
+    pep_exists = pep_file.exists()
 
-def generate_sheets(reads_dir, assembly_dir, enable_blacklist, blacklist_clean, outdir, blacklist_file, tmpdir):
-  # Generating dirs
-  os.makedirs(outdir, exist_ok=True)
-  os.makedirs(tmpdir, exist_ok=True)
+    pep_text = (
+        "pep_version: 2.1.0\n"
+        "sample_table: 'sample_sheet.csv'\n"
+        "subsample_table: 'subsample_sheet.csv'\n"
+    )
 
-  # Screening input files
-  reads_metadata = screen_files(directory = reads_dir, type = "Reads")
-  assembly_metadata = screen_files(directory = assembly_dir, type = "Assembly")
+    print("Writing project configuration file", end="... ")
+    with open(pep_file, "w") as config_file:
+        config_file.write(pep_text)
 
-  metadata = pandas.concat([reads_metadata, assembly_metadata], ignore_index = True, sort = True)
+    if not pep_exists:
+        print(f"Success: Written to {pep_file}")
+    else:
+        print(f"Success: Overwriting {pep_file}")
 
-  # Inspect blacklist if enabled
-  blacklist_exists = os.path.exists(blacklist_file)  
-  if blacklist_exists:
-    print("Blacklist file detected, reading!")
-    blacklist = pandas.read_csv(blacklist_file, sep = "\t")
 
-    exclude_samples = blacklist["file"].values
-  
-    # Filter metadata
-    metadata = metadata[~metadata["file"].isin(exclude_samples)].reset_index()
-    if not enable_blacklist:
-      print("Warning: Blacklist was included, yet current samples will NOT be added to the blacklist file!")
+def generate_sheets(reads_dir, assembly_dir, enable_blacklist, outdir, blacklist_file, tmpdir):
+    outdir_path = Path(outdir).resolve()
+    tmpdir_path = Path(tmpdir).resolve()
+    blacklist_path = Path(blacklist_file).resolve()
 
-  # Ensuring not all samples have been filtered out
-  sample_size = len(metadata.index)
-  if sample_size > 0:
-    
-    # Generate symlinks
-    create_symlinks(metadata, tmpdir)
+    outdir_path.mkdir(parents=True, exist_ok=True)
+    tmpdir_path.mkdir(parents=True, exist_ok=True)
 
-    # Ensure PEP folder exists
-    pepdir = f"{outdir}/schemas"
-    pepdir_exists = os.path.isdir(pepdir)
+    reads_metadata = screen_files(directory=reads_dir, file_type="Reads")
+    assembly_metadata = screen_files(directory=assembly_dir, file_type="Assembly")
 
-    if not pepdir_exists:
-      os.makedirs(pepdir, exist_ok = True) 
+    metadata = pd.concat([reads_metadata, assembly_metadata], ignore_index=True, sort=True)
 
-    sample_sheet = make_sample_sheet(metadata)
-    sample_sheet_updated = write_sample_sheet(sample_sheet, pepdir)
+    if blacklist_path.exists():
+        print("Blacklist file detected, reading!")
+        blacklist = pd.read_csv(blacklist_path, sep="\t")
 
-    subsample_sheet = metadata[["sample_name", "mate", "file"]]
-    subsample_sheet_updated = write_subsample_sheet(subsample_sheet, pepdir)
-    sample_files = metadata['file']
+        if "file" not in blacklist.columns:
+            eprint(f"ERROR: Blacklist file exists but lacks required 'file' column: {blacklist_path}")
+            sys.exit(1)
 
-    # Generate PEP configuration files.
-    write_PEP(pepdir)
-  else:
-    print("No new samples detected after enable_blacklist.")
-    sample_files = []
+        exclude_samples = blacklist["file"].values
+        metadata = metadata[~metadata["file"].isin(exclude_samples)].reset_index(drop=True)
 
-  return(sample_files)
+        if not enable_blacklist:
+            print("Warning: Blacklist was included, yet current samples will NOT be added to the blacklist file!")
+
+    if len(metadata.index) > 0:
+        create_symlinks(metadata, tmpdir_path)
+
+        pepdir = outdir_path / "schemas"
+        pepdir.mkdir(parents=True, exist_ok=True)
+
+        sample_sheet = make_sample_sheet(metadata)
+        write_sample_sheet(sample_sheet, pepdir)
+
+        subsample_cols = [c for c in ["sample_name", "mate", "file"] if c in metadata.columns]
+        subsample_sheet = metadata[subsample_cols]
+        write_subsample_sheet(subsample_sheet, pepdir)
+
+        sample_files = metadata["file"]
+        write_pep(pepdir)
+    else:
+        print("No new samples detected after blacklist filtering.")
+        sample_files = pd.Series(dtype=str)
+
+    return sample_files
 
 
 def update_blacklist(enable_blacklist, blacklist_file, blacklist_clean, sample_files):
-  blacklist_exists = os.path.isfile(blacklist_file)
-  include_header = not blacklist_exists or blacklist_clean
+    blacklist_path = Path(blacklist_file).resolve()
+    blacklist_exists = blacklist_path.is_file()
+    include_header = (not blacklist_exists) or blacklist_clean
 
-  write = False
-  if enable_blacklist:
-    if not blacklist_clean:
-      mode = "a"
-      if blacklist_exists:
-        print("Appending to existing blacklist file")
-  elif blacklist_clean:
-    mode = "w"
-    if blacklist_exists:
-      print("Overwriting preexisting blacklist file")
-  elif not enable_blacklist and not blacklist_clean:
-      return(False)
-  else:
-      print("Created new blacklist file")
-   
-  sample_files.to_csv(blacklist_file, sep = "\t", index=False, mode = mode, header = include_header)
-    
-  return(True)
+    if enable_blacklist:
+        mode = "w" if blacklist_clean else "a"
+        if blacklist_exists and not blacklist_clean:
+            print("Appending to existing blacklist file")
+        if blacklist_exists and blacklist_clean:
+            print("Overwriting preexisting blacklist file")
+    elif blacklist_clean:
+        mode = "w"
+        if blacklist_exists:
+            print("Overwriting preexisting blacklist file")
+    else:
+        return False
+
+    sample_files.to_csv(blacklist_path, sep="\t", index=False, mode=mode, header=include_header)
+    return True
 
 
 def parse_arguments():
-  parser = argparse.ArgumentParser(description = "Screen read files and assemblies for Serovar biomarker genes, in order to preovide suggestions for isolate serovar. Currently only supporting Actinobacillus Pleuropneumoniae.")
-  parser.add_argument("-r", metavar = "--reads_dir", dest = "reads_dir", help = "Input path to reads directory", required = False)
-  parser.add_argument("-a", metavar = "--assembly_dir", dest = "assembly_dir", help = "Input path to assembly directory", required = False)
-  parser.add_argument("-D", metavar = "--database", dest = "database", help = "Path and prefix to kmer-aligner database", default = "./db")
-  parser.add_argument("-o", metavar = "--outdir", dest = "outdir", help = "Output path to Results and Temporary files directory", required = True)
-  parser.add_argument("-T", metavar = "--theshold", dest = "threshold", help = "Cutoff threshold of match coverage and identity. Ignore threshold by setting to 0 or False. (Default 98)", default = 98)
-  parser.add_argument("-R", dest = "append_results", help = "Append to existing results file. (Default False)", action = "store_true")
-  parser.add_argument("-b", dest = "enable_blacklist", help = "Update existing blacklist file with new samples. Creates a blacklist file if non exists. (Default False)", action = "store_true")
-  parser.add_argument("-B", dest = "blacklist_clean", help = "Ignore and overwrite existing blacklist file. Creates a blacklist if non exists. (Default False)", action = "store_true")
-  parser.add_argument("-k", dest = "keep_tmp", help = "Preserve temporary files such as KMA result files. (Default False)", action = "store_true")
-  parser.add_argument("-t", metavar = "--threads", dest = "threads", help = "Number of threads to allocate for the pipeline. (Default 3)", default = 3)
-  parser.add_argument("-F", dest = "force", help = "Force rerun of all tasks in pipeline. (Default False)", action = "store_true")
-  parser.add_argument("-n", dest = "dry_run", help = "Perform a dry run with Snakemake to see jobs but without executing them. (Default False)", action = "store_true")
-  parser.add_argument("-d", dest = "debug", help = "Enable debug mode, stores snakemake object for inspection in R. (Default False)", action = "store_true")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Screen read files and assemblies for serovar biomarker genes to provide "
+            "suggestions for isolate serovar. Currently supports Actinobacillus "
+            "pleuropneumoniae."
+        )
+    )
+    parser.add_argument("-r", dest="reads_dir", help="Input path to reads directory", required=False)
+    parser.add_argument("-a", dest="assembly_dir", help="Input path to assembly directory", required=False)
+    parser.add_argument(
+        "-D",
+        dest="database",
+        help="Path and prefix to kmer-aligner database",
+        default="./db",
+    )
+    parser.add_argument(
+        "-o",
+        dest="outdir",
+        help="Output path to results and temporary files directory",
+        required=True,
+    )
+    parser.add_argument(
+        "-T",
+        dest="threshold",
+        help="Cutoff threshold of match coverage and identity. Ignore threshold by setting to 0. Default: 98",
+        default=98,
+    )
+    parser.add_argument(
+        "-R",
+        dest="append_results",
+        help="Append to existing results file",
+        action="store_true",
+    )
+    parser.add_argument(
+        "-b",
+        dest="enable_blacklist",
+        help="Update existing blacklist file with new samples. Creates a blacklist file if none exists",
+        action="store_true",
+    )
+    parser.add_argument(
+        "-B",
+        dest="blacklist_clean",
+        help="Ignore and overwrite existing blacklist file. Creates a blacklist if none exists",
+        action="store_true",
+    )
+    parser.add_argument(
+        "-k",
+        dest="keep_tmp",
+        help="Preserve temporary files such as KMA result files",
+        action="store_true",
+    )
+    parser.add_argument(
+        "-t",
+        dest="threads",
+        help="Number of threads to allocate for the pipeline. Default: 3",
+        default=3,
+    )
+    parser.add_argument(
+        "-F",
+        dest="force",
+        help="Force rerun of all tasks in pipeline",
+        action="store_true",
+    )
+    parser.add_argument(
+        "-n",
+        dest="dry_run",
+        help="Perform a dry run with Snakemake to see jobs without executing them",
+        action="store_true",
+    )
+    parser.add_argument(
+        "-d",
+        dest="debug",
+        help="Enable debug mode",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--conda-prefix",
+        dest="conda_prefix",
+        help=(
+            "Path to Snakemake conda environment cache. "
+            "Can also be set via SEROVAR_DETECTOR_CONDA_PREFIX. "
+            "Default: auto-resolved portable cache location."
+        ),
+        required=False,
+    )
+    parser.add_argument(
+        "--conda-frontend",
+        dest="conda_frontend",
+        choices=["conda", "mamba"],
+        default=None,
+        help="Optional Snakemake conda frontend to use if supported by installed Snakemake",
+    )
+    parser.add_argument(
+        "--latency-wait",
+        dest="latency_wait",
+        type=int,
+        default=240,
+        help=(
+            "Snakemake latency wait in seconds for shared/network filesystems. "
+            "Default: 240 (tuned for HPC shared FS). Lower on local disks if desired."
+        ),
+    )
 
-  return(parser.parse_args())
+    return parser.parse_args()
 
 
-# Derrive arguments
-args = parse_arguments()
+def main():
+    args = parse_arguments()
 
-database = os.path.abspath(args.database)
-outdir = os.path.abspath(args.outdir)
-threshold = args.threshold
-append_results = args.append_results
-enable_blacklist = args.enable_blacklist
-blacklist_clean = args.blacklist_clean
-keep_tmp = args.keep_tmp
-threads = args.threads
-force = args.force
-dry_run = args.dry_run
-debug = args.debug
-tmpdir = f"{outdir}/tmp"
-blacklist_file = f"{outdir}/blacklist.tsv"
+    tool_dir = Path(__file__).resolve().parent
+    outdir = str(Path(args.outdir).resolve())
+    tmpdir = f"{outdir}/tmp"
+    blacklist_file = f"{outdir}/blacklist.tsv"
 
-# Polish input
-if not args.reads_dir:
-  reads_dir = args.reads_dir
-else:
-  reads_dir = os.path.abspath(args.reads_dir)
-if not args.assembly_dir:
-  assembly_dir = args.assembly_dir
-else:
-  assembly_dir = os.path.abspath(args.assembly_dir)
+    conda_prefix = resolve_conda_prefix(args.conda_prefix, tool_dir, outdir, debug=args.debug)
 
-# Validate snakemake structure
-validate_snakemake(debug)
+    db_arg = args.database
+    if os.path.isabs(db_arg):
+        database = str(Path(db_arg).resolve())
+    else:
+        database = str((tool_dir / db_arg).resolve())
 
-if enable_blacklist and blacklist_clean and os.path.isfile(blacklist_file):
-  print("Blacklist file detected, in addition blacklist update and blacklist clean options has been selected. Don't know which to chose, please decide to either update existing blacklist ('-b') or make a clean blacklist ('-B'), not both!")
+    try:
+        threshold = int(args.threshold)
+    except Exception:
+        eprint(f"ERROR: Invalid threshold value: {args.threshold}")
+        sys.exit(1)
 
-# Prepare config file for snakemake
-generate_configfile(database = database, outdir = outdir, threshold = threshold, append_results = append_results, threads = threads, debug = debug, tmpdir = tmpdir)
+    try:
+        threads = int(args.threads)
+        if threads < 1:
+            raise ValueError
+    except Exception:
+        eprint(f"ERROR: Invalid thread count: {args.threads}")
+        sys.exit(1)
 
-# Generate subsample sheet
-sample_files = generate_sheets(reads_dir = reads_dir, assembly_dir = assembly_dir, enable_blacklist = enable_blacklist, blacklist_clean = blacklist_clean, outdir = outdir, blacklist_file = blacklist_file, tmpdir = tmpdir)
+    append_results = args.append_results
+    enable_blacklist = args.enable_blacklist
+    blacklist_clean = args.blacklist_clean
+    keep_tmp = args.keep_tmp
+    force = args.force
+    dry_run = args.dry_run
+    debug = args.debug
 
-if len(sample_files) == 0:
-  print("Nothing to do exitting!")
-  sys.exit(0)
+    reads_dir = str(Path(args.reads_dir).resolve()) if args.reads_dir else None
+    assembly_dir = str(Path(args.assembly_dir).resolve()) if args.assembly_dir else None
 
-snake_args = ""
-if force or blacklist_clean:
-  snake_args += " -F "
-if dry_run:
-  snake_args += " -n "
+    if not reads_dir and not assembly_dir:
+        eprint("ERROR: At least one of -r/--reads_dir or -a/--assembly_dir must be provided.")
+        sys.exit(1)
 
-snakemake_cmd = "snakemake --use-conda --cores %s%s" %(threads, snake_args) 
-if debug:
-  print("Running command: %s" %snakemake_cmd)
+    snakefile = validate_snakemake(tool_dir, debug)
+
+    if enable_blacklist and blacklist_clean and os.path.isfile(blacklist_file):
+        eprint("Blacklist file detected, and BOTH blacklist update (-b) and blacklist clean (-B) were selected.")
+        eprint("Please choose either update existing blacklist (-b) OR overwrite (-B), not both.")
+        sys.exit(1)
+
+    generate_configfile(
+        database=database,
+        outdir=outdir,
+        threshold=threshold,
+        append_results=append_results,
+        threads=threads,
+        debug=debug,
+        tmpdir=tmpdir,
+    )
+
+    outdir_path = Path(outdir).resolve()
+    config_dir = outdir_path / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+
+    profiles_src = tool_dir / "config" / "serovar_profiles.yaml"
+    profiles_dst = config_dir / "serovar_profiles.yaml"
+
+    if not profiles_src.is_file():
+        eprint(f"ERROR: Missing serovar profiles file: {profiles_src}")
+        sys.exit(1)
+
+    shutil.copy2(profiles_src, profiles_dst)
+
+    if debug:
+        print(f"Staged serovar profiles: {profiles_dst}")
+
+    sample_files = generate_sheets(
+        reads_dir=reads_dir,
+        assembly_dir=assembly_dir,
+        enable_blacklist=enable_blacklist,
+        outdir=outdir,
+        blacklist_file=blacklist_file,
+        tmpdir=tmpdir,
+    )
+
+    if len(sample_files) == 0:
+        print("Nothing to do, exiting!")
+        sys.exit(0)
+
+    snakemake_cmd = [
+        "snakemake",
+        "--snakefile",
+        str(snakefile),
+        "--directory",
+        str(outdir_path),
+        "--use-conda",
+        "--conda-prefix",
+        conda_prefix,
+        "--cores",
+        str(threads),
+    ]
+
+    if args.latency_wait < 0:
+        eprint("ERROR: --latency-wait must be >= 0")
+        sys.exit(1)
+    snakemake_cmd.extend(["--latency-wait", str(args.latency_wait)])
+
+    if args.conda_frontend:
+        snakemake_cmd.extend(["--conda-frontend", args.conda_frontend])
+
+    if force or blacklist_clean:
+        snakemake_cmd.append("-F")
+    if dry_run:
+        snakemake_cmd.append("-n")
+
+    if debug:
+        print("Running command:")
+        print(" ".join(snakemake_cmd))
+
+    results_file = outdir_path / "serovar.tsv"
+    do_append = append_results and results_file.is_file()
+
+    if do_append:
+        results_tmp = results_file.with_suffix(".tmp")
+        print(f"Copying {results_file} to {results_tmp}")
+        shutil.copy(results_file, results_tmp)
+
+    if shutil.which("snakemake") is None:
+        eprint("ERROR: 'snakemake' command not found in PATH.")
+        sys.exit(1)
+
+    result = subprocess.run(snakemake_cmd, check=False)
+    if result.returncode != 0:
+        eprint("Something went wrong while executing Snakemake.")
+        sys.exit(result.returncode)
+
+    update_blacklist(
+        enable_blacklist=enable_blacklist,
+        blacklist_file=blacklist_file,
+        blacklist_clean=blacklist_clean,
+        sample_files=sample_files,
+    )
+
+    if do_append:
+        print("Appending new results to existing results")
+        results_tmp = results_file.with_suffix(".tmp")
+        serovar_new = pd.read_csv(results_file, sep="\t")
+        shutil.move(results_tmp, results_file)
+        serovar_new.to_csv(results_file, sep="\t", index=False, mode="a", header=False)
+
+    if not keep_tmp:
+        print("Cleaning up temporary files.")
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    print("All Done!")
 
 
-results_file = f"{outdir}/serovar.tsv"
-do_append = append_results and os.path.isfile(results_file)
-if do_append:
-  results_tmp = os.path.splitext(results_file)[0] + ".tmp"
-  print(f"Copying {results_file} to {results_tmp}")
-  shutil.copy(results_file, results_tmp)
-
-snake_success = subprocess.Popen(snakemake_cmd, shell = True).wait()
-
-if snake_success != 0:
-  print("Something went wrong while executing snakemake")
-else:
-  update_blacklist(enable_blacklist = enable_blacklist, blacklist_file = blacklist_file, blacklist_clean = blacklist_clean, sample_files = sample_files)
-
-  if do_append:
-    print("Appending new results to existing results")
-    serovar_new = pandas.read_csv(results_file, sep = "\t")
-    shutil.move(results_tmp, results_file)
-    serovar_new.to_csv(results_file, sep = "\t", index = False, mode = "a", header = False)
-
-  if not keep_tmp:
-    print("Cleaning up temporary files.")
-    shutil.rmtree(tmpdir)
-
-  print("All Done!")
-
+if __name__ == "__main__":
+    main()
